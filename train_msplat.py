@@ -9,6 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+
 import os
 import numpy as np
 import torch
@@ -16,6 +17,13 @@ from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui, render_ms
 import sys
+
+sys.path.append('/root/autodl-tmp/RAFT')
+from core.raft import RAFT
+from core.utils import flow_viz
+from core.utils.utils import InputPadder
+
+
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
 import uuid
@@ -26,6 +34,7 @@ from arguments import ModelParams, PipelineParams, OptimizationParams
 import msplat
 import cv2
 from utils.sh_utils import eval_sh
+from flow_vis import flow_to_image
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -56,6 +65,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+    
+    
+    
+    
+    ###### RAFT part ######
+    RAFT_args = Namespace()
+    RAFT_args.model = "/root/autodl-tmp/RAFT/models/raft-things.pth"
+    RAFT_args.small = False
+    RAFT_args.mixed_precision = True
+    RAFT_args.alternate_corr = False
+    model = torch.nn.DataParallel(RAFT(RAFT_args))
+    model.load_state_dict(torch.load(RAFT_args.model))
+
+    model = model.module
+    model.cuda()
+    model.eval()
+    
     for iteration in range(first_iter, opt.iterations + 1):        
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -101,39 +127,72 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
         # image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
+        ############# shape adjustment ##############
+        if iteration%1000==0:
+            padder = InputPadder(next_viewpoint_cam.original_image.shape)
+            image1, image2 = padder.pad(viewpoint_cam.original_image, next_viewpoint_cam.original_image)
+            if image1.shape != image2.shape:
+                next_viewpoint_cam.original_image = image2
+            else:
+                viewpoint_cam.original_image = image1
+                next_viewpoint_cam.original_image = image2
+            viewpoint_cam.image_width = viewpoint_cam.original_image.shape[2]
+            viewpoint_cam.image_height = viewpoint_cam.original_image.shape[1]
+            next_viewpoint_cam.image_width = next_viewpoint_cam.original_image.shape[2]
+            next_viewpoint_cam.image_height = next_viewpoint_cam.original_image.shape[1]
+
+
+            flow_low, flow_up = model(viewpoint_cam.original_image.unsqueeze(0)*255, next_viewpoint_cam.original_image.unsqueeze(0)*255, iters=20, test_mode=True)
+            flow_up = -flow_up.squeeze(0)
+            
+            
+            
         render_ms_pkg = render_ms(viewpoint_cam, next_viewpoint_cam, gaussians, pipe, bg)
         image_msplat, viewspace_point_tensor, visibility_filter, radii = render_ms_pkg["render"], render_ms_pkg["viewspace_points"], render_ms_pkg["visibility_filter"], render_ms_pkg["radii"]
-        image_depth =  render_ms_pkg['depth']
-        image_normal = render_ms_pkg['normal']
-        image_flow = render_ms_pkg['flow']
+        
+        
         if iteration % 1000 == 0:
             cv2.imwrite("comp/  msplat_{}.jpg".format(iteration), image_msplat.permute(1,2,0).cpu().detach().numpy()*255)
+            
             ############## depth visulization #################
-            depth_map = image_depth.squeeze(0)
+            # image_depth =  render_ms_pkg['depth']
+            # depth_map = image_depth.squeeze(0)
+            # normalized_depth_map = ((depth_map - torch.min(depth_map)) / ( torch.max(depth_map) -  torch.min(depth_map))).cpu().detach().numpy()
 
-            # 归一化深度图到0-1
-            normalized_depth_map = ((depth_map - torch.min(depth_map)) / ( torch.max(depth_map) -  torch.min(depth_map))).cpu().detach().numpy()
-
-            # 映射到0-255并转换为uint8
-            depth_map_0_255 = (normalized_depth_map * 255).astype(np.uint8)
-            cv2.imwrite("comp/depth_{}.jpg".format(iteration), depth_map_0_255)
+            # # 映射到0-255并转换为uint8
+            # depth_map_0_255 = (normalized_depth_map * 255).astype(np.uint8)
+            # cv2.imwrite("comp/depth_{}.jpg".format(iteration), depth_map_0_255)
             
 
             ############## normal visulization #################
-            image_normal = image_normal.cpu().detach().numpy()
-            # 转置tensor以匹配OpenCV的图像格式[H, W, 3]
-            normal_map = np.transpose(image_normal, (1, 2, 0))
+            # image_normal = render_ms_pkg['normal']
+            # image_normal = image_normal.cpu().detach().numpy()
+            # # 转置tensor以匹配OpenCV的图像格式[H, W, 3]
+            # normal_map = np.transpose(image_normal, (1, 2, 0))
 
-            normal_map_visualized = ((normal_map + 1) / 2.0 * 255).astype(np.uint8)
-            cv2.imwrite("comp/normal_{}.jpg".format(iteration), normal_map_visualized)
+            # normal_map_visualized = ((normal_map + 1) / 2.0 * 255).astype(np.uint8)
+            # cv2.imwrite("comp/normal_{}.jpg".format(iteration), normal_map_visualized)
 
-            ############## normal visulization #################
+            ############## sceneflow visulization #################
+            # image_flow = render_ms_pkg['sceneflow']
+            # image_flow = ((image_flow - torch.min(image_flow)) / ( torch.max(image_flow) -  torch.min(image_flow))).cpu().detach().numpy()
+            # # 转置tensor以匹配OpenCV的图像格式[H, W, 3]
+            # flow_map = np.transpose(image_flow, (1, 2, 0))
+
+            # flow_map_visualized = (flow_map * 255).astype(np.uint8)
+            # cv2.imwrite("comp/sceneflow_{}.jpg".format(iteration), flow_map_visualized)
+            
+            ############## opticalflow visulization #################
+            image_flow = render_ms_pkg['opticalflow'].permute(1,2,0)
             image_flow = ((image_flow - torch.min(image_flow)) / ( torch.max(image_flow) -  torch.min(image_flow))).cpu().detach().numpy()
-            # 转置tensor以匹配OpenCV的图像格式[H, W, 3]
-            flow_map = np.transpose(image_flow, (1, 2, 0))
-
-            flow_map_visualized = (flow_map * 255).astype(np.uint8)
-            cv2.imwrite("comp/flow_{}.jpg".format(iteration), flow_map_visualized)
+            image_flow = flow_to_image(image_flow)
+            cv2.imwrite("comp/opticalflow_{}.jpg".format(iteration), image_flow)
+            image_flow = flow_up.permute(1,2,0)
+            image_flow = ((image_flow - torch.min(image_flow)) / ( torch.max(image_flow) -  torch.min(image_flow))).cpu().detach().numpy()
+            image_flow = flow_to_image(image_flow)
+            cv2.imwrite("comp/RAFT_opticalflow_{}.jpg".format(iteration), image_flow)
+            ############## opticalflow visulization #################
+            
         image = image_msplat
         # exit()
         
@@ -258,7 +317,7 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
-    
+
     print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)

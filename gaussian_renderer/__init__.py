@@ -278,37 +278,39 @@ def render_ms(viewpoint_camera, next_viewpoint_camera, pc : GaussianModel, pipe,
         
     depth_render = None
     normal_render = None
+    sceneflow_render = None
     ######### depth #########
-    depth_render = ms.alpha_blending(
-            uv, conic, opacity, depth,
-            gaussian_ids_sorted, tile_range, bg_color[0].item(), width, height, ndc
-        )
+    # depth_render = ms.alpha_blending(
+    #         uv, conic, opacity, depth,
+    #         gaussian_ids_sorted, tile_range, bg_color[0].item(), width, height, ndc
+    #     )
 
     ######### normal #########
-    
-    direction = torch.nn.functional.one_hot(torch.argmin(scaling, dim=-1), num_classes=3).cuda().float()
-    normal_render = ms.alpha_blending(
-            uv, conic, opacity, direction,
-            gaussian_ids_sorted, tile_range, bg_color[0].item(), width, height, ndc
-    )
+    # direction = torch.nn.functional.one_hot(torch.argmin(scaling, dim=-1), num_classes=3).cuda().float()
+    # normal_render = ms.alpha_blending(
+    #         uv, conic, opacity, direction,
+    #         gaussian_ids_sorted, tile_range, bg_color[0].item(), width, height, ndc
+    # )
     ######### Scene flow #########
+    # extrinsic_matrix = extrinsic_matrix[:,:3]
+    # extrinsic_matrix_2 = next_viewpoint_camera.world_view_transform.transpose(0, 1)
+    # extrinsic_matrix_2 = extrinsic_matrix_2[:3, :3]
+    # diff = position@extrinsic_matrix_2 - position@extrinsic_matrix
+    # sceneflow_render = ms.alpha_blending(
+    #     uv, conic, opacity, diff,
+    #     gaussian_ids_sorted, tile_range, bg_color[0].item(), width, height, ndc
+    # )
+    ######### Optical flow #########
     extrinsic_matrix = extrinsic_matrix[:,:3]
     extrinsic_matrix_2 = next_viewpoint_camera.world_view_transform.transpose(0, 1)
     extrinsic_matrix_2 = extrinsic_matrix_2[:3, :3]
-    diff = position@extrinsic_matrix_2 - position@extrinsic_matrix
-    render_scene_flow = ms.alpha_blending(
+    diff = (position@extrinsic_matrix_2 - position@extrinsic_matrix)[:, :2]
+    # print(diff.shape)
+    opticalflow_render = ms.alpha_blending(
         uv, conic, opacity, diff,
         gaussian_ids_sorted, tile_range, bg_color[0].item(), width, height, ndc
     )
-    ######### Scene flow #########
-    extrinsic_matrix = extrinsic_matrix[:,:3]
-    extrinsic_matrix_2 = next_viewpoint_camera.world_view_transform.transpose(0, 1)
-    extrinsic_matrix_2 = extrinsic_matrix_2[:3, :3]
-    diff = position@extrinsic_matrix_2 - position@extrinsic_matrix
-    sceneflow_render = ms.alpha_blending(
-        uv, conic, opacity, diff,
-        gaussian_ids_sorted, tile_range, bg_color[0].item(), width, height, ndc
-    )
+    # exit()
     
     return {"render": render,
             "viewspace_points": ndc,
@@ -316,5 +318,6 @@ def render_ms(viewpoint_camera, next_viewpoint_camera, pc : GaussianModel, pipe,
             "radii": radius,
             "depth": depth_render,
             "normal": normal_render,
-            "sceneflow": sceneflow_render}
+            "sceneflow": sceneflow_render,
+            "opticalflow": opticalflow_render}
     
