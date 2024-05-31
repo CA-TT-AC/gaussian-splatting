@@ -128,31 +128,54 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         ############# shape adjustment ##############
-        if iteration%1000==0:
-            padder = InputPadder(next_viewpoint_cam.original_image.shape)
-            image1, image2 = padder.pad(viewpoint_cam.original_image, next_viewpoint_cam.original_image)
-            if image1.shape != image2.shape:
-                next_viewpoint_cam.original_image = image2
+        if iteration%1==0:
+            if not hasattr(next_viewpoint_cam, "flow_up") or not hasattr(viewpoint_cam, "flow_up"):
+                with torch.no_grad():
+                    padder = InputPadder(next_viewpoint_cam.original_image.shape)
+                    image1, image2 = padder.pad(viewpoint_cam.original_image, next_viewpoint_cam.original_image)
+                    if image1.shape != image2.shape:
+                        next_viewpoint_cam.original_image = image2
+                    else:
+                        viewpoint_cam.original_image = image1
+                        next_viewpoint_cam.original_image = image2
+                    viewpoint_cam.image_width = viewpoint_cam.original_image.shape[2]
+                    viewpoint_cam.image_height = viewpoint_cam.original_image.shape[1]
+                    next_viewpoint_cam.image_width = next_viewpoint_cam.original_image.shape[2]
+                    next_viewpoint_cam.image_height = next_viewpoint_cam.original_image.shape[1]
+
+                    flow_low, flow_up = model(viewpoint_cam.original_image.unsqueeze(0)*255, next_viewpoint_cam.original_image.unsqueeze(0)*255, iters=20, test_mode=True)
+                    flow_up = -flow_up.squeeze(0)
+                    viewpoint_cam.flow_up = flow_up.detach()
             else:
-                viewpoint_cam.original_image = image1
-                next_viewpoint_cam.original_image = image2
-            viewpoint_cam.image_width = viewpoint_cam.original_image.shape[2]
-            viewpoint_cam.image_height = viewpoint_cam.original_image.shape[1]
-            next_viewpoint_cam.image_width = next_viewpoint_cam.original_image.shape[2]
-            next_viewpoint_cam.image_height = next_viewpoint_cam.original_image.shape[1]
-
-
-            flow_low, flow_up = model(viewpoint_cam.original_image.unsqueeze(0)*255, next_viewpoint_cam.original_image.unsqueeze(0)*255, iters=20, test_mode=True)
-            flow_up = -flow_up.squeeze(0)
-            
+                flow_up = viewpoint_cam.flow_up
             
             
         render_ms_pkg = render_ms(viewpoint_cam, next_viewpoint_cam, gaussians, pipe, bg)
         image_msplat, viewspace_point_tensor, visibility_filter, radii = render_ms_pkg["render"], render_ms_pkg["viewspace_points"], render_ms_pkg["visibility_filter"], render_ms_pkg["radii"]
         
+            
+        image = image_msplat
+        # exit()
         
+        # Loss
+        gt_image = viewpoint_cam.original_image.cuda()
+        Ll1 = l1_loss(image, gt_image)
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        # print(render_ms_pkg['opticalflow'].mean(), render_ms_pkg['opticalflow'].max())
+        # print(flow_up.mean(), flow_up.max())
+        flow_loss = l1_loss(render_ms_pkg['opticalflow'], flow_up)
+        if iteration % 100 == 0:
+            print("loss:", loss.item())
+            print("flow loss:", flow_loss.item())
+        # loss += flow_loss / flow_loss.item() * loss.item() / 4
+        
+        loss.backward()
+
+        iter_end.record()
+
         if iteration % 1000 == 0:
-            cv2.imwrite("comp/  msplat_{}.jpg".format(iteration), image_msplat.permute(1,2,0).cpu().detach().numpy()*255)
+            image_msplat = cv2.cvtColor(image_msplat.permute(1,2,0).cpu().detach().numpy()*255, cv2.COLOR_BGR2RGB, )
+            cv2.imwrite("comp/msplat_{}.jpg".format(iteration), image_msplat)
             
             ############## depth visulization #################
             # image_depth =  render_ms_pkg['depth']
@@ -187,22 +210,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             image_flow = ((image_flow - torch.min(image_flow)) / ( torch.max(image_flow) -  torch.min(image_flow))).cpu().detach().numpy()
             image_flow = flow_to_image(image_flow)
             cv2.imwrite("comp/opticalflow_{}.jpg".format(iteration), image_flow)
-            image_flow = flow_up.permute(1,2,0)
-            image_flow = ((image_flow - torch.min(image_flow)) / ( torch.max(image_flow) -  torch.min(image_flow))).cpu().detach().numpy()
-            image_flow = flow_to_image(image_flow)
-            cv2.imwrite("comp/RAFT_opticalflow_{}.jpg".format(iteration), image_flow)
+            # image_flow = flow_up.permute(1,2,0)
+            # image_flow = ((image_flow - torch.min(image_flow)) / ( torch.max(image_flow) -  torch.min(image_flow))).cpu().detach().numpy()
+            # image_flow = flow_to_image(image_flow)
+            # cv2.imwrite("comp/RAFT_opticalflow_{}.jpg".format(iteration), image_flow)
             ############## opticalflow visulization #################
-            
-        image = image_msplat
-        # exit()
-        
-        # Loss
-        gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-        loss.backward()
 
-        iter_end.record()
 
         with torch.no_grad():
             # Progress bar
@@ -242,6 +255,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
 def prepare_output_and_logger(args):    
+
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
@@ -310,12 +324,13 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[3_000, 10000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[3_000, 10000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
+    args.iterations = 10000
     args.save_iterations.append(args.iterations)
 
     print("Optimizing " + args.model_path)
