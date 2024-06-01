@@ -70,6 +70,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     
     
     ###### RAFT part ######
+    padder = None
     RAFT_args = Namespace()
     RAFT_args.model = "/root/autodl-tmp/RAFT/models/raft-things.pth"
     RAFT_args.small = False
@@ -128,26 +129,42 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         ############# shape adjustment ##############
-        if iteration%1==0:
-            if not hasattr(next_viewpoint_cam, "flow_up") or not hasattr(viewpoint_cam, "flow_up"):
-                with torch.no_grad():
+        if not hasattr(next_viewpoint_cam, "flow_up") or not hasattr(viewpoint_cam, "flow_up"):
+            with torch.no_grad():
+                if padder is None:
                     padder = InputPadder(next_viewpoint_cam.original_image.shape)
-                    image1, image2 = padder.pad(viewpoint_cam.original_image, next_viewpoint_cam.original_image)
-                    if image1.shape != image2.shape:
-                        next_viewpoint_cam.original_image = image2
-                    else:
-                        viewpoint_cam.original_image = image1
-                        next_viewpoint_cam.original_image = image2
-                    viewpoint_cam.image_width = viewpoint_cam.original_image.shape[2]
-                    viewpoint_cam.image_height = viewpoint_cam.original_image.shape[1]
-                    next_viewpoint_cam.image_width = next_viewpoint_cam.original_image.shape[2]
-                    next_viewpoint_cam.image_height = next_viewpoint_cam.original_image.shape[1]
+                if viewpoint_cam.image_width % 8 != 0:
+                    viewpoint_cam.original_image = padder.pad(viewpoint_cam.original_image)[0]
+                if next_viewpoint_cam.image_width % 8 != 0:
+                    next_viewpoint_cam.original_image = padder.pad(next_viewpoint_cam.original_image)[0]
+                viewpoint_cam.image_width = viewpoint_cam.original_image.shape[2]
+                viewpoint_cam.image_height = viewpoint_cam.original_image.shape[1]
+                next_viewpoint_cam.image_width = next_viewpoint_cam.original_image.shape[2]
+                next_viewpoint_cam.image_height = next_viewpoint_cam.original_image.shape[1]
 
-                    flow_low, flow_up = model(viewpoint_cam.original_image.unsqueeze(0)*255, next_viewpoint_cam.original_image.unsqueeze(0)*255, iters=20, test_mode=True)
-                    flow_up = -flow_up.squeeze(0)
-                    viewpoint_cam.flow_up = flow_up.detach()
-            else:
-                flow_up = viewpoint_cam.flow_up
+                flow_low, flow_up = model(viewpoint_cam.original_image.unsqueeze(0)*255, next_viewpoint_cam.original_image.unsqueeze(0)*255, iters=20, test_mode=True)
+                flow_up = -flow_up.squeeze(0)
+                viewpoint_cam.flow_up = flow_up.detach()
+            filename = viewpoint_cam.image_name + "_pred.npy"
+            gt_path = "/root/autodl-tmp/GeoWizard/geowizard/ffll_output"
+            depth_gt = np.load(os.path.join(gt_path, "depth_npy", filename))
+            depth_gt = torch.tensor(depth_gt).cuda()
+            depth_gt = padder.pad(depth_gt.unsqueeze(0))[0].squeeze(0)
+            depth_gt = ((depth_gt - torch.min(depth_gt)) / ( torch.max(depth_gt) -  torch.min(depth_gt)))
+            # cv2.imwrite("comp/AAA_depth_gt_{}.jpg".format(viewpoint_cam.image_name), (depth_gt*255).cpu().numpy())
+            
+            normal_gt = np.load(os.path.join(gt_path, "normal_npy", filename))
+            normal_gt = torch.tensor(normal_gt).cuda().permute(2,0,1)
+            normal_gt = padder.pad(normal_gt)[0].permute(1,2,0)
+            viewpoint_cam.depth_gt = depth_gt
+            viewpoint_cam.normal_gt = normal_gt
+
+            # print(normal_gt.shape)
+            
+            # exit()
+        else:
+            flow_up = viewpoint_cam.flow_up
+            depth_gt = viewpoint_cam.depth_gt
             
             
         render_ms_pkg = render_ms(viewpoint_cam, next_viewpoint_cam, gaussians, pipe, bg)
@@ -161,14 +178,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-        # print(render_ms_pkg['opticalflow'].mean(), render_ms_pkg['opticalflow'].max())
-        # print(flow_up.mean(), flow_up.max())
+        
+        # optical flow loss
         flow_loss = l1_loss(render_ms_pkg['opticalflow'], flow_up)
-        if iteration % 100 == 0:
-            print("loss:", loss.item())
-            print("flow loss:", flow_loss.item())
+
         # loss += flow_loss / flow_loss.item() * loss.item() / 4
         
+        
+        
+        
+        image_depth =  render_ms_pkg['depth']
+        depth_map = image_depth.squeeze(0)
+        normalized_depth_map = ((depth_map - torch.min(depth_map)) / ( torch.max(depth_map) -  torch.min(depth_map)))
+        depth_loss = l1_loss(normalized_depth_map, viewpoint_cam.depth_gt)
+        loss += depth_loss / depth_loss.detach().item() * loss.item() 
+        
+
+        image_normal = render_ms_pkg['normal']
+        image_normal = image_normal.permute(1,2,0)
+        # print(image_normal.shape)
+        if iteration % 100 == 0:
+            print("loss:", loss.item())
+            # print("flow loss:", flow_loss.item())
+            print("depth_loss:", depth_loss.item())
         loss.backward()
 
         iter_end.record()
@@ -181,19 +213,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # image_depth =  render_ms_pkg['depth']
             # depth_map = image_depth.squeeze(0)
             # normalized_depth_map = ((depth_map - torch.min(depth_map)) / ( torch.max(depth_map) -  torch.min(depth_map))).cpu().detach().numpy()
-
             # # 映射到0-255并转换为uint8
-            # depth_map_0_255 = (normalized_depth_map * 255).astype(np.uint8)
-            # cv2.imwrite("comp/depth_{}.jpg".format(iteration), depth_map_0_255)
-            
+            depth_map_0_255 = (normalized_depth_map * 255).cpu().detach().numpy()
+            cv2.imwrite("comp/depth_{}.jpg".format(iteration), depth_map_0_255)
+            depth_gt_255 = (viewpoint_cam.depth_gt * 255).cpu().detach().numpy()
+            cv2.imwrite("comp/depth_gt_{}.jpg".format(iteration), depth_gt_255)
 
             ############## normal visulization #################
-            # image_normal = render_ms_pkg['normal']
-            # image_normal = image_normal.cpu().detach().numpy()
-            # # 转置tensor以匹配OpenCV的图像格式[H, W, 3]
-            # normal_map = np.transpose(image_normal, (1, 2, 0))
+            
+            image_normal = render_ms_pkg['normal']
+            image_normal = image_normal.cpu().detach().numpy()
+            # 转置tensor以匹配OpenCV的图像格式[H, W, 3]
+            normal_map = np.transpose(image_normal, (1, 2, 0))
 
-            # normal_map_visualized = ((normal_map + 1) / 2.0 * 255).astype(np.uint8)
+            normal_map_visualized = ((normal_map + 1) / 2.0 * 255).astype(np.uint8)
+            # print(normal_map_visualized.shape)
             # cv2.imwrite("comp/normal_{}.jpg".format(iteration), normal_map_visualized)
 
             ############## sceneflow visulization #################
