@@ -9,7 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-
+import torch.nn.functional as F
 import os
 import numpy as np
 import torch
@@ -144,6 +144,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 flow_low, flow_up = model(viewpoint_cam.original_image.unsqueeze(0)*255, next_viewpoint_cam.original_image.unsqueeze(0)*255, iters=20, test_mode=True)
                 flow_up = -flow_up.squeeze(0)
+                # flow_up = (flow_up - torch.min(flow_up)) / ( torch.max(flow_up) -  torch.min(flow_up))
                 viewpoint_cam.flow_up = flow_up.detach()
             filename = viewpoint_cam.image_name + "_pred.npy"
             gt_path = "/root/autodl-tmp/GeoWizard/geowizard/ffll_output"
@@ -154,17 +155,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # cv2.imwrite("comp/AAA_depth_gt_{}.jpg".format(viewpoint_cam.image_name), (depth_gt*255).cpu().numpy())
             
             normal_gt = np.load(os.path.join(gt_path, "normal_npy", filename))
-            normal_gt = torch.tensor(normal_gt).cuda().permute(2,0,1)
+            normal_gt = torch.tensor(normal_gt).cuda()
+            normal_gt = F.normalize(normal_gt, dim=-1).permute(2,0,1)
             normal_gt = padder.pad(normal_gt)[0].permute(1,2,0)
             viewpoint_cam.depth_gt = depth_gt
             viewpoint_cam.normal_gt = normal_gt
-
-            # print(normal_gt.shape)
             
             # exit()
         else:
             flow_up = viewpoint_cam.flow_up
             depth_gt = viewpoint_cam.depth_gt
+            normal_gt = viewpoint_cam.normal_gt
             
             
         render_ms_pkg = render_ms(viewpoint_cam, next_viewpoint_cam, gaussians, pipe, bg)
@@ -179,28 +180,34 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         
-        # optical flow loss
-        flow_loss = l1_loss(render_ms_pkg['opticalflow'], flow_up)
-
-        # loss += flow_loss / flow_loss.item() * loss.item() / 4
+        ori_loss = loss
+        
+        ########### optical flow loss ##########
+        # opticalflow_norm = (render_ms_pkg['opticalflow'] - torch.min(render_ms_pkg['opticalflow'])) / ( torch.max(render_ms_pkg['opticalflow']) -  torch.min(render_ms_pkg['opticalflow']))
+        # flow_up = (flow_up - torch.min(flow_up)) / ( torch.max(flow_up) -  torch.min(flow_up))
+        flow_loss = l1_loss(render_ms_pkg['opticalflow'],  flow_up)
+        loss += flow_loss / flow_loss.item() * ori_loss.item() / 2
         
         
         
-        
+        ########### depth loss ##########
         image_depth =  render_ms_pkg['depth']
         depth_map = image_depth.squeeze(0)
         normalized_depth_map = ((depth_map - torch.min(depth_map)) / ( torch.max(depth_map) -  torch.min(depth_map)))
         depth_loss = l1_loss(normalized_depth_map, viewpoint_cam.depth_gt)
-        loss += depth_loss / depth_loss.detach().item() * loss.item() 
+        # loss += depth_loss / depth_loss.detach().item() * ori_loss.item() 
         
-
+        
+        ########### normal loss ##########
         image_normal = render_ms_pkg['normal']
         image_normal = image_normal.permute(1,2,0)
-        # print(image_normal.shape)
+        normal_loss = l1_loss(image_normal, viewpoint_cam.normal_gt)
+        # loss += normal_loss / normal_loss.detach().item() * ori_loss.item() / 4
         if iteration % 100 == 0:
             print("loss:", loss.item())
-            # print("flow loss:", flow_loss.item())
+            print("flow loss:", flow_loss.item())
             print("depth_loss:", depth_loss.item())
+            print("normal loss:", normal_loss.item())
         loss.backward()
 
         iter_end.record()
@@ -213,7 +220,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # image_depth =  render_ms_pkg['depth']
             # depth_map = image_depth.squeeze(0)
             # normalized_depth_map = ((depth_map - torch.min(depth_map)) / ( torch.max(depth_map) -  torch.min(depth_map))).cpu().detach().numpy()
-            # # 映射到0-255并转换为uint8
+            # # # 映射到0-255并转换为uint8
             depth_map_0_255 = (normalized_depth_map * 255).cpu().detach().numpy()
             cv2.imwrite("comp/depth_{}.jpg".format(iteration), depth_map_0_255)
             depth_gt_255 = (viewpoint_cam.depth_gt * 255).cpu().detach().numpy()
@@ -226,10 +233,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # 转置tensor以匹配OpenCV的图像格式[H, W, 3]
             normal_map = np.transpose(image_normal, (1, 2, 0))
 
-            normal_map_visualized = ((normal_map + 1) / 2.0 * 255).astype(np.uint8)
-            # print(normal_map_visualized.shape)
-            # cv2.imwrite("comp/normal_{}.jpg".format(iteration), normal_map_visualized)
-
+            normal_map_visualized = ((normal_map + 1) / 2.0 * 255)
+            print(normal_map_visualized.shape)
+            cv2.imwrite("comp/normal_{}.jpg".format(iteration), normal_map_visualized)
+            normal_gt = normal_gt.cpu().detach().numpy()
+            normal_gt_visulized = ((normal_gt + 1) / 2.0 * 255)
+            cv2.imwrite("comp/normal_gt_{}.jpg".format(iteration), normal_gt_visulized)
             ############## sceneflow visulization #################
             # image_flow = render_ms_pkg['sceneflow']
             # image_flow = ((image_flow - torch.min(image_flow)) / ( torch.max(image_flow) -  torch.min(image_flow))).cpu().detach().numpy()
@@ -242,13 +251,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ############## opticalflow visulization #################
             image_flow = render_ms_pkg['opticalflow'].permute(1,2,0)
             image_flow = ((image_flow - torch.min(image_flow)) / ( torch.max(image_flow) -  torch.min(image_flow))).cpu().detach().numpy()
+            print(image_flow.shape)
             image_flow = flow_to_image(image_flow)
             cv2.imwrite("comp/opticalflow_{}.jpg".format(iteration), image_flow)
-            # image_flow = flow_up.permute(1,2,0)
-            # image_flow = ((image_flow - torch.min(image_flow)) / ( torch.max(image_flow) -  torch.min(image_flow))).cpu().detach().numpy()
-            # image_flow = flow_to_image(image_flow)
-            # cv2.imwrite("comp/RAFT_opticalflow_{}.jpg".format(iteration), image_flow)
-            ############## opticalflow visulization #################
+            image_flow = flow_up.permute(1,2,0)
+            image_flow = ((image_flow - torch.min(image_flow)) / ( torch.max(image_flow) -  torch.min(image_flow))).cpu().detach().numpy()
+            image_flow = flow_to_image(image_flow)
+            cv2.imwrite("comp/RAFT_opticalflow_{}.jpg".format(iteration), image_flow)
+            ############## end visulization #################
 
 
         with torch.no_grad():
@@ -260,8 +270,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration == opt.iterations:
                 progress_bar.close()
 
+            loss = {"Ll1": Ll1, "total_loss": loss, "depth_loss": depth_loss, "normal_loss": normal_loss, "flow_loss": flow_loss}
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            training_report(tb_writer, iteration, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render_ms, (pipe, background))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -311,10 +322,11 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+def training_report(tb_writer, iteration, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
     if tb_writer:
-        tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
-        tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
+        for key in loss.keys():
+            tb_writer.add_scalar('train_loss_patches/'+key, loss[key].item(), iteration)
+
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
     # Report test and samples of training set
@@ -328,12 +340,33 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 l1_test = 0.0
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
+                    next_viewpoint = config['cameras'][(idx+1)%(len(config['cameras']))]
+                    ms_pkg = renderFunc(viewpoint, next_viewpoint, scene.gaussians, *renderArgs)
+                    image = torch.clamp(ms_pkg["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
+                        ### add rendered depth map
+                        depth_map =  ms_pkg['depth']
+                        normalized_depth_map = ((depth_map - torch.min(depth_map)) / ( torch.max(depth_map) -  torch.min(depth_map)))
+                        tb_writer.add_images(config['name'] + "_view_{}/render_depth".format(viewpoint.image_name), normalized_depth_map[None], global_step=iteration)
+                        ### add rendered normal map
+                        image_normal = ms_pkg['normal']
+                        tb_writer.add_images(config['name'] + "_view_{}/render_normal".format(viewpoint.image_name), image_normal[None], global_step=iteration)
+
+                        ## TODO: add optical flow visulization of test data 
+
+                        
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                            
+                            ### ground thuth of depth map
+                            filename = viewpoint.image_name + "_pred.npy"
+                            gt_path = "/root/autodl-tmp/GeoWizard/geowizard/ffll_output"
+                            depth_gt = torch.tensor(np.load(os.path.join(gt_path, "depth_npy", filename))).unsqueeze(0)
+                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth_depth".format(viewpoint.image_name), depth_gt[None], global_step=iteration)
+                            normal_gt = (torch.tensor(np.load(os.path.join(gt_path, "normal_npy", filename))).permute(2,0,1)+1)/2
+                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth_normal".format(viewpoint.image_name), normal_gt[None], global_step=iteration)
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                 psnr_test /= len(config['cameras'])
@@ -366,7 +399,7 @@ if __name__ == "__main__":
     args = parser.parse_args(sys.argv[1:])
     args.iterations = 10000
     args.save_iterations.append(args.iterations)
-
+    
     print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)
